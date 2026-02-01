@@ -30,6 +30,8 @@ import json
 
 import pytz
 
+from config.settings import get_settings
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -40,8 +42,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Default tickers to collect
-DEFAULT_TICKERS = ["SPY", "QQQ", "IWM", "DIA", "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "TSLA"]
+# Load settings
+settings = get_settings()
 
 # Timezone for scheduling
 ET = pytz.timezone("America/New_York")
@@ -70,7 +72,7 @@ class DailyCollector:
             rate: Risk-free rate for SVI fitting
             dividend_yield: Dividend yield for SVI fitting
         """
-        self.tickers = tickers or DEFAULT_TICKERS
+        self.tickers = tickers or settings.default_tickers
         self.database_url = database_url
         self.rate = rate
         self.dividend_yield = dividend_yield
@@ -414,8 +416,8 @@ def main():
     parser.add_argument(
         "--time",
         type=str,
-        default="16:30",
-        help="Time to run daily (HH:MM in ET), default: 16:30",
+        default=settings.collection_time,
+        help=f"Time to run daily (HH:MM in ET), default: {settings.collection_time}",
     )
     parser.add_argument(
         "--tickers",

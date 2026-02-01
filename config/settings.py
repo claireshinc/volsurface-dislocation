@@ -49,6 +49,16 @@ class Settings(BaseSettings):
         description="Standard tenor days for feature extraction",
     )
 
+    # Data Collection
+    default_tickers: list[str] = Field(
+        default=["SPY", "QQQ", "IWM", "DIA", "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "TSLA"],
+        description="Default tickers for daily data collection",
+    )
+    collection_time: str = Field(
+        default="16:30",
+        description="Daily collection time in ET (HH:MM format)",
+    )
+
     # Logging
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = Field(
         default="INFO",

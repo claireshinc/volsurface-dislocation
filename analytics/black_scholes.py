@@ -1,23 +1,52 @@
-"""Black-Scholes option pricing and Greeks.
+"""Black-Scholes option pricing and Greeks using QuantLib.
 
-Implements the standard Black-Scholes-Merton model for European options:
-    Call = S*N(d1) - K*exp(-r*T)*N(d2)
-    Put  = K*exp(-r*T)*N(-d2) - S*N(-d1)
+This module provides option pricing using QuantLib's robust implementation.
+QuantLib handles all the numerical details and edge cases properly.
 
-Where:
-    d1 = [ln(S/K) + (r + σ²/2)*T] / (σ*√T)
-    d2 = d1 - σ*√T
+QuantLib Pricing Flow:
+=====================
+
+1. Create MARKET DATA (Quotes)
+   └── SimpleQuote for spot, vol, rate
+
+2. Build TERM STRUCTURES
+   ├── YieldTermStructure (interest rates)
+   └── BlackVolTermStructure (volatility)
+
+3. Create STOCHASTIC PROCESS
+   └── BlackScholesMertonProcess (GBM dynamics)
+
+4. Create INSTRUMENT
+   └── VanillaOption (payoff + exercise)
+
+5. Attach PRICING ENGINE
+   └── AnalyticEuropeanEngine (closed-form BS)
+
+6. PRICE and compute GREEKS
+   └── option.NPV(), option.delta(), etc.
+
+Example:
+    >>> bs = BlackScholes(spot=100, rate=0.05)
+    >>> price = bs.price(strike=100, expiry=0.25, vol=0.2, option_type="call")
+    >>> greeks = bs.greeks(strike=100, expiry=0.25, vol=0.2, option_type="call")
 """
 
 import logging
 from dataclasses import dataclass
 from enum import Enum
-from typing import Literal
+from typing import Literal, Tuple
 
 import numpy as np
 from numpy.typing import NDArray
-from scipy.stats import norm
-from scipy.optimize import brentq
+import QuantLib as ql
+
+from analytics.quantlib_utils import (
+    QuantLibSetup,
+    create_black_scholes_process,
+    create_vanilla_option,
+    create_american_option,
+    PricingEngineFactory,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -33,12 +62,15 @@ class OptionType(str, Enum):
 class Greeks:
     """Option Greeks container.
 
+    Greeks measure option price sensitivity to various factors.
+    QuantLib computes these via finite differencing on the pricing model.
+
     Attributes:
-        delta: Rate of change of option price with spot
-        gamma: Rate of change of delta with spot
-        vega: Sensitivity to volatility (per 1% move)
-        theta: Time decay (per day)
-        rho: Sensitivity to interest rate (per 1% move)
+        delta: ∂V/∂S - Sensitivity to underlying price
+        gamma: ∂²V/∂S² - Rate of change of delta
+        vega: ∂V/∂σ - Sensitivity to volatility (per 1% move)
+        theta: ∂V/∂t - Time decay (per day)
+        rho: ∂V/∂r - Sensitivity to interest rate (per 1% move)
     """
 
     delta: float
@@ -59,13 +91,26 @@ class Greeks:
 
 
 class BlackScholes:
-    """Black-Scholes option pricing and Greeks calculator.
+    """Black-Scholes option pricing using QuantLib.
+
+    This class wraps QuantLib's European option pricing functionality
+    with a simple interface. It handles all the QuantLib setup internally.
+
+    QuantLib Components Used:
+    - BlackScholesMertonProcess: Models underlying dynamics
+    - AnalyticEuropeanEngine: Closed-form BS pricing
+    - VanillaOption: European option instrument
 
     Example:
-        >>> bs = BlackScholes(spot=100, rate=0.05)
-        >>> price = bs.price(strike=100, expiry=0.25, vol=0.2, option_type="call")
-        >>> greeks = bs.greeks(strike=100, expiry=0.25, vol=0.2, option_type="call")
-        >>> print(f"Call price: ${price:.2f}, Delta: {greeks.delta:.3f}")
+        >>> bs = BlackScholes(spot=100, rate=0.05, dividend_yield=0.02)
+        >>>
+        >>> # Price a call option
+        >>> price = bs.price(strike=105, expiry=0.25, vol=0.2, option_type="call")
+        >>> print(f"Call price: ${price:.2f}")
+        >>>
+        >>> # Get all Greeks
+        >>> greeks = bs.greeks(strike=105, expiry=0.25, vol=0.2, option_type="call")
+        >>> print(f"Delta: {greeks.delta:.3f}, Gamma: {greeks.gamma:.4f}")
     """
 
     def __init__(
@@ -76,8 +121,10 @@ class BlackScholes:
     ):
         """Initialize Black-Scholes calculator.
 
+        Sets up the QuantLib environment and stores market parameters.
+
         Args:
-            spot: Current spot price
+            spot: Current spot price of the underlying
             rate: Risk-free interest rate (annualized, continuous)
             dividend_yield: Continuous dividend yield
         """
@@ -85,39 +132,55 @@ class BlackScholes:
         self.rate = rate
         self.dividend_yield = dividend_yield
 
-    def _d1_d2(
+        # Initialize QuantLib setup
+        self._setup = QuantLibSetup()
+        self._eval_date = ql.Settings.instance().evaluationDate
+
+    def _create_option_and_engine(
         self,
         strike: float,
         expiry: float,
         vol: float,
-    ) -> tuple[float, float]:
-        """Calculate d1 and d2 parameters.
+        option_type: str,
+    ) -> ql.VanillaOption:
+        """Create a priced QuantLib option.
 
-        d1 = [ln(S/K) + (r - q + σ²/2)*T] / (σ*√T)
-        d2 = d1 - σ*√T
+        This internal method:
+        1. Creates the BSM process with current market data
+        2. Creates the vanilla option instrument
+        3. Attaches the analytic pricing engine
+        4. Returns the option ready for pricing
 
         Args:
             strike: Strike price
             expiry: Time to expiry in years
-            vol: Implied volatility (annualized)
+            vol: Implied volatility
+            option_type: "call" or "put"
 
         Returns:
-            Tuple of (d1, d2)
+            QuantLib VanillaOption with engine attached
         """
-        if expiry <= 0:
-            raise ValueError("Expiry must be positive")
-        if vol <= 0:
-            raise ValueError("Volatility must be positive")
+        # Convert expiry to QuantLib date
+        expiry_days = int(expiry * 365)
+        expiry_date = self._eval_date + ql.Period(expiry_days, ql.Days)
 
-        sqrt_t = np.sqrt(expiry)
-        r_adj = self.rate - self.dividend_yield
-
-        d1 = (np.log(self.spot / strike) + (r_adj + vol**2 / 2) * expiry) / (
-            vol * sqrt_t
+        # Create the stochastic process
+        process, _ = create_black_scholes_process(
+            spot=self.spot,
+            rate=self.rate,
+            dividend_yield=self.dividend_yield,
+            volatility=vol,
+            eval_date=self._eval_date,
         )
-        d2 = d1 - vol * sqrt_t
 
-        return d1, d2
+        # Create the option
+        option = create_vanilla_option(strike, expiry_date, option_type)
+
+        # Attach the analytic engine
+        engine = ql.AnalyticEuropeanEngine(process)
+        option.setPricingEngine(engine)
+
+        return option
 
     def price(
         self,
@@ -126,7 +189,10 @@ class BlackScholes:
         vol: float,
         option_type: Literal["call", "put"] | OptionType = OptionType.CALL,
     ) -> float:
-        """Calculate option price using Black-Scholes formula.
+        """Calculate option price using QuantLib.
+
+        Uses the AnalyticEuropeanEngine which implements the
+        closed-form Black-Scholes-Merton formula.
 
         Args:
             strike: Strike price
@@ -135,29 +201,18 @@ class BlackScholes:
             option_type: 'call' or 'put'
 
         Returns:
-            Option price
+            Option price (NPV - Net Present Value)
 
         Example:
             >>> bs = BlackScholes(spot=100, rate=0.05)
             >>> call_price = bs.price(100, 0.25, 0.2, "call")
+            >>> put_price = bs.price(100, 0.25, 0.2, "put")
         """
-        if isinstance(option_type, str):
-            option_type = OptionType(option_type.lower())
+        if isinstance(option_type, OptionType):
+            option_type = option_type.value
 
-        d1, d2 = self._d1_d2(strike, expiry, vol)
-        discount = np.exp(-self.rate * expiry)
-        forward_discount = np.exp(-self.dividend_yield * expiry)
-
-        if option_type == OptionType.CALL:
-            return (
-                self.spot * forward_discount * norm.cdf(d1)
-                - strike * discount * norm.cdf(d2)
-            )
-        else:
-            return (
-                strike * discount * norm.cdf(-d2)
-                - self.spot * forward_discount * norm.cdf(-d1)
-            )
+        option = self._create_option_and_engine(strike, expiry, vol, option_type)
+        return option.NPV()
 
     def delta(
         self,
@@ -166,11 +221,12 @@ class BlackScholes:
         vol: float,
         option_type: Literal["call", "put"] | OptionType = OptionType.CALL,
     ) -> float:
-        """Calculate option delta.
+        """Calculate option delta using QuantLib.
 
         Delta = ∂V/∂S
-        Call delta = exp(-q*T) * N(d1)
-        Put delta = -exp(-q*T) * N(-d1)
+
+        QuantLib computes delta by differentiating the pricing formula
+        with respect to the spot price.
 
         Args:
             strike: Strike price
@@ -179,18 +235,13 @@ class BlackScholes:
             option_type: 'call' or 'put'
 
         Returns:
-            Delta value
+            Delta value (call: 0 to 1, put: -1 to 0)
         """
-        if isinstance(option_type, str):
-            option_type = OptionType(option_type.lower())
+        if isinstance(option_type, OptionType):
+            option_type = option_type.value
 
-        d1, _ = self._d1_d2(strike, expiry, vol)
-        forward_discount = np.exp(-self.dividend_yield * expiry)
-
-        if option_type == OptionType.CALL:
-            return forward_discount * norm.cdf(d1)
-        else:
-            return -forward_discount * norm.cdf(-d1)
+        option = self._create_option_and_engine(strike, expiry, vol, option_type)
+        return option.delta()
 
     def gamma(
         self,
@@ -198,11 +249,11 @@ class BlackScholes:
         expiry: float,
         vol: float,
     ) -> float:
-        """Calculate option gamma.
+        """Calculate option gamma using QuantLib.
 
-        Gamma = ∂²V/∂S² = N'(d1) / (S * σ * √T)
+        Gamma = ∂²V/∂S² = ∂Δ/∂S
 
-        Same for both calls and puts.
+        Gamma is the same for calls and puts with same strike/expiry.
 
         Args:
             strike: Strike price
@@ -210,16 +261,10 @@ class BlackScholes:
             vol: Implied volatility
 
         Returns:
-            Gamma value
+            Gamma value (always positive)
         """
-        d1, _ = self._d1_d2(strike, expiry, vol)
-        forward_discount = np.exp(-self.dividend_yield * expiry)
-
-        return (
-            forward_discount
-            * norm.pdf(d1)
-            / (self.spot * vol * np.sqrt(expiry))
-        )
+        option = self._create_option_and_engine(strike, expiry, vol, "call")
+        return option.gamma()
 
     def vega(
         self,
@@ -227,11 +272,12 @@ class BlackScholes:
         expiry: float,
         vol: float,
     ) -> float:
-        """Calculate option vega (sensitivity to volatility).
+        """Calculate option vega using QuantLib.
 
-        Vega = S * N'(d1) * √T * exp(-q*T)
+        Vega = ∂V/∂σ
 
-        Returns vega per 1% move in vol (divided by 100).
+        Returns vega per 1% move in volatility (divided by 100).
+        Same for calls and puts.
 
         Args:
             strike: Strike price
@@ -241,13 +287,9 @@ class BlackScholes:
         Returns:
             Vega value (per 1% vol move)
         """
-        d1, _ = self._d1_d2(strike, expiry, vol)
-        forward_discount = np.exp(-self.dividend_yield * expiry)
-
-        # Vega per 1% move
-        return (
-            self.spot * forward_discount * norm.pdf(d1) * np.sqrt(expiry) / 100
-        )
+        option = self._create_option_and_engine(strike, expiry, vol, "call")
+        # QuantLib returns vega per 1.0 vol change, we want per 0.01
+        return option.vega() / 100
 
     def theta(
         self,
@@ -256,12 +298,11 @@ class BlackScholes:
         vol: float,
         option_type: Literal["call", "put"] | OptionType = OptionType.CALL,
     ) -> float:
-        """Calculate option theta (time decay).
+        """Calculate option theta using QuantLib.
+
+        Theta = ∂V/∂t
 
         Returns theta per calendar day (divided by 365).
-
-        Theta = -S*N'(d1)*σ*exp(-q*T)/(2√T) - r*K*exp(-r*T)*N(d2) + q*S*exp(-q*T)*N(d1)
-            (for calls, sign adjustments for puts)
 
         Args:
             strike: Strike price
@@ -270,36 +311,14 @@ class BlackScholes:
             option_type: 'call' or 'put'
 
         Returns:
-            Theta value (per calendar day)
+            Theta value (per calendar day, usually negative)
         """
-        if isinstance(option_type, str):
-            option_type = OptionType(option_type.lower())
+        if isinstance(option_type, OptionType):
+            option_type = option_type.value
 
-        d1, d2 = self._d1_d2(strike, expiry, vol)
-        sqrt_t = np.sqrt(expiry)
-        forward_discount = np.exp(-self.dividend_yield * expiry)
-        discount = np.exp(-self.rate * expiry)
-
-        # Common term
-        term1 = (
-            -self.spot * forward_discount * norm.pdf(d1) * vol / (2 * sqrt_t)
-        )
-
-        if option_type == OptionType.CALL:
-            theta_annual = (
-                term1
-                - self.rate * strike * discount * norm.cdf(d2)
-                + self.dividend_yield * self.spot * forward_discount * norm.cdf(d1)
-            )
-        else:
-            theta_annual = (
-                term1
-                + self.rate * strike * discount * norm.cdf(-d2)
-                - self.dividend_yield * self.spot * forward_discount * norm.cdf(-d1)
-            )
-
-        # Convert to per-day
-        return theta_annual / 365
+        option = self._create_option_and_engine(strike, expiry, vol, option_type)
+        # QuantLib returns theta per year, convert to per day
+        return option.theta() / 365
 
     def rho(
         self,
@@ -308,12 +327,11 @@ class BlackScholes:
         vol: float,
         option_type: Literal["call", "put"] | OptionType = OptionType.CALL,
     ) -> float:
-        """Calculate option rho (sensitivity to interest rate).
+        """Calculate option rho using QuantLib.
+
+        Rho = ∂V/∂r
 
         Returns rho per 1% move in rate (divided by 100).
-
-        Call rho = K * T * exp(-r*T) * N(d2)
-        Put rho = -K * T * exp(-r*T) * N(-d2)
 
         Args:
             strike: Strike price
@@ -324,16 +342,12 @@ class BlackScholes:
         Returns:
             Rho value (per 1% rate move)
         """
-        if isinstance(option_type, str):
-            option_type = OptionType(option_type.lower())
+        if isinstance(option_type, OptionType):
+            option_type = option_type.value
 
-        _, d2 = self._d1_d2(strike, expiry, vol)
-        discount = np.exp(-self.rate * expiry)
-
-        if option_type == OptionType.CALL:
-            return strike * expiry * discount * norm.cdf(d2) / 100
-        else:
-            return -strike * expiry * discount * norm.cdf(-d2) / 100
+        option = self._create_option_and_engine(strike, expiry, vol, option_type)
+        # QuantLib returns rho per 1.0 rate change, we want per 0.01
+        return option.rho() / 100
 
     def greeks(
         self,
@@ -343,6 +357,9 @@ class BlackScholes:
         option_type: Literal["call", "put"] | OptionType = OptionType.CALL,
     ) -> Greeks:
         """Calculate all Greeks for an option.
+
+        Efficiently computes all Greeks in one call by reusing
+        the same QuantLib option object.
 
         Args:
             strike: Strike price
@@ -356,14 +373,23 @@ class BlackScholes:
         Example:
             >>> bs = BlackScholes(spot=100, rate=0.05)
             >>> g = bs.greeks(100, 0.25, 0.2, "call")
-            >>> print(f"Delta: {g.delta:.3f}, Gamma: {g.gamma:.4f}")
+            >>> print(f"Delta: {g.delta:.3f}")
+            >>> print(f"Gamma: {g.gamma:.4f}")
+            >>> print(f"Vega:  {g.vega:.2f}")
+            >>> print(f"Theta: {g.theta:.3f}")
+            >>> print(f"Rho:   {g.rho:.3f}")
         """
+        if isinstance(option_type, OptionType):
+            option_type = option_type.value
+
+        option = self._create_option_and_engine(strike, expiry, vol, option_type)
+
         return Greeks(
-            delta=self.delta(strike, expiry, vol, option_type),
-            gamma=self.gamma(strike, expiry, vol),
-            vega=self.vega(strike, expiry, vol),
-            theta=self.theta(strike, expiry, vol, option_type),
-            rho=self.rho(strike, expiry, vol, option_type),
+            delta=option.delta(),
+            gamma=option.gamma(),
+            vega=option.vega() / 100,  # Per 1% vol
+            theta=option.theta() / 365,  # Per day
+            rho=option.rho() / 100,  # Per 1% rate
         )
 
     def implied_volatility(
@@ -374,10 +400,10 @@ class BlackScholes:
         option_type: Literal["call", "put"] | OptionType = OptionType.CALL,
         vol_bounds: tuple[float, float] = (0.001, 5.0),
     ) -> float:
-        """Calculate implied volatility from market price.
+        """Calculate implied volatility from market price using QuantLib.
 
-        Uses Brent's method to solve for vol such that
-        BS_price(vol) = market_price.
+        Uses QuantLib's built-in IV solver which employs Brent's method
+        to find the volatility that matches the market price.
 
         Args:
             market_price: Observed market price
@@ -394,26 +420,52 @@ class BlackScholes:
 
         Example:
             >>> bs = BlackScholes(spot=100, rate=0.05)
-            >>> iv = bs.implied_volatility(5.50, 100, 0.25, "call")
+            >>> price = 5.50
+            >>> iv = bs.implied_volatility(price, 100, 0.25, "call")
+            >>> print(f"Implied Vol: {iv:.2%}")
         """
-        if isinstance(option_type, str):
-            option_type = OptionType(option_type.lower())
+        if isinstance(option_type, OptionType):
+            option_type = option_type.value
 
-        def objective(vol: float) -> float:
-            return self.price(strike, expiry, vol, option_type) - market_price
+        # Convert expiry to QuantLib date
+        expiry_days = int(expiry * 365)
+        expiry_date = self._eval_date + ql.Period(expiry_days, ql.Days)
+
+        # Create the option
+        option = create_vanilla_option(strike, expiry_date, option_type)
+
+        # Create a process with dummy vol (will be solved for)
+        process, _ = create_black_scholes_process(
+            spot=self.spot,
+            rate=self.rate,
+            dividend_yield=self.dividend_yield,
+            volatility=0.20,  # Initial guess
+            eval_date=self._eval_date,
+        )
+
+        # Use QuantLib's implied volatility solver
+        engine = ql.AnalyticEuropeanEngine(process)
+        option.setPricingEngine(engine)
 
         try:
-            iv = brentq(objective, vol_bounds[0], vol_bounds[1])
-            return float(iv)
-        except ValueError:
+            iv = option.impliedVolatility(
+                market_price,
+                process,
+                accuracy=1e-6,
+                maxEvaluations=100,
+                minVol=vol_bounds[0],
+                maxVol=vol_bounds[1],
+            )
+            return iv
+        except RuntimeError as e:
             raise ValueError(
-                f"Could not find IV in range {vol_bounds} for price {market_price}"
+                f"Could not find IV in range {vol_bounds} for price {market_price}: {e}"
             )
 
     def forward_price(self, expiry: float) -> float:
         """Calculate forward price.
 
-        F = S * exp((r - q) * T)
+        F = S × exp((r - q) × T)
 
         Args:
             expiry: Time to expiry in years
@@ -432,6 +484,9 @@ class BlackScholes:
     ) -> float:
         """Find strike corresponding to a given delta.
 
+        Uses numerical search to find the strike where
+        the option delta equals the target.
+
         Args:
             delta: Target delta (e.g., 0.25 for 25-delta)
             expiry: Time to expiry in years
@@ -443,30 +498,48 @@ class BlackScholes:
 
         Example:
             >>> bs = BlackScholes(spot=100, rate=0.05)
-            >>> k25d = bs.strike_from_delta(0.25, 0.25, 0.2, "put")
+            >>> k25d_put = bs.strike_from_delta(0.25, 0.25, 0.2, "put")
+            >>> k25d_call = bs.strike_from_delta(0.25, 0.25, 0.2, "call")
         """
-        if isinstance(option_type, str):
-            option_type = OptionType(option_type.lower())
+        if isinstance(option_type, OptionType):
+            option_type = option_type.value
 
-        forward_discount = np.exp(-self.dividend_yield * expiry)
-        sqrt_t = np.sqrt(expiry)
+        from scipy.optimize import brentq
 
-        if option_type == OptionType.CALL:
-            # For call: delta = exp(-q*T) * N(d1)
-            # So N(d1) = delta / exp(-q*T)
-            # d1 = N_inv(delta / exp(-q*T))
-            d1 = norm.ppf(delta / forward_discount)
-        else:
-            # For put: delta = -exp(-q*T) * N(-d1)
-            # So N(-d1) = -delta / exp(-q*T)
-            # -d1 = N_inv(-delta / exp(-q*T))
-            d1 = -norm.ppf(-delta / forward_discount)
+        def delta_diff(strike: float) -> float:
+            calc_delta = self.delta(strike, expiry, vol, option_type)
+            if option_type == "put":
+                return abs(calc_delta) - delta
+            return calc_delta - delta
 
-        # K = S * exp(-(d1*σ√T - (r-q+σ²/2)*T))
+        # Search bounds based on option type
         forward = self.forward_price(expiry)
-        strike = forward * np.exp(-(d1 * vol * sqrt_t - vol**2 * expiry / 2))
 
-        return strike
+        if option_type == "call":
+            # Call delta decreases with strike, search above spot for low delta
+            low_strike = forward * 0.5
+            high_strike = forward * 2.0
+        else:
+            # Put delta (absolute) decreases with strike, search below spot for low delta
+            low_strike = forward * 0.5
+            high_strike = forward * 1.5
+
+        try:
+            strike = brentq(delta_diff, low_strike, high_strike)
+            return strike
+        except ValueError:
+            # Fallback to simple approximation
+            logger.warning(f"Could not find exact strike for {delta} delta {option_type}")
+            from scipy.stats import norm
+            sqrt_t = np.sqrt(expiry)
+
+            if option_type == "call":
+                d1 = norm.ppf(delta * np.exp(self.dividend_yield * expiry))
+            else:
+                d1 = -norm.ppf(delta * np.exp(self.dividend_yield * expiry))
+
+            strike = forward * np.exp(-(d1 * vol * sqrt_t - vol**2 * expiry / 2))
+            return strike
 
 
 def vectorized_price(
@@ -479,6 +552,11 @@ def vectorized_price(
 ) -> NDArray[np.float64]:
     """Vectorized Black-Scholes pricing.
 
+    Prices multiple options efficiently using QuantLib.
+
+    Note: For very large arrays, consider using numpy-based
+    formulas directly as QuantLib has Python overhead per option.
+
     Args:
         spots: Spot prices
         strikes: Strike prices
@@ -490,13 +568,213 @@ def vectorized_price(
     Returns:
         Option prices
     """
-    sqrt_t = np.sqrt(expiries)
-    d1 = (np.log(spots / strikes) + (rates + vols**2 / 2) * expiries) / (vols * sqrt_t)
-    d2 = d1 - vols * sqrt_t
+    prices = np.zeros(len(spots))
 
-    discount = np.exp(-rates * expiries)
+    for i in range(len(spots)):
+        bs = BlackScholes(spot=spots[i], rate=rates[i])
+        opt_type = "call" if option_types[i] else "put"
+        prices[i] = bs.price(strikes[i], expiries[i], vols[i], opt_type)
 
-    call_prices = spots * norm.cdf(d1) - strikes * discount * norm.cdf(d2)
-    put_prices = strikes * discount * norm.cdf(-d2) - spots * norm.cdf(-d1)
+    return prices
 
-    return np.where(option_types, call_prices, put_prices)
+
+class AmericanOptionPricer:
+    """Price American options using QuantLib finite difference methods.
+
+    American options can be exercised at any time before expiry.
+    They require numerical methods since no closed-form solution exists.
+
+    QuantLib Methods Used:
+    - FdBlackScholesVanillaEngine: Finite difference PDE solver
+    - BinomialVanillaEngine: Cox-Ross-Rubinstein tree
+
+    Example:
+        >>> pricer = AmericanOptionPricer(spot=100, rate=0.05)
+        >>> price = pricer.price(strike=100, expiry=0.25, vol=0.2, option_type="put")
+    """
+
+    def __init__(
+        self,
+        spot: float,
+        rate: float = 0.0,
+        dividend_yield: float = 0.0,
+    ):
+        """Initialize American option pricer.
+
+        Args:
+            spot: Current spot price
+            rate: Risk-free rate
+            dividend_yield: Dividend yield
+        """
+        self.spot = spot
+        self.rate = rate
+        self.dividend_yield = dividend_yield
+        self._eval_date = ql.Settings.instance().evaluationDate
+
+    def price(
+        self,
+        strike: float,
+        expiry: float,
+        vol: float,
+        option_type: str = "call",
+        method: str = "fd",
+        steps: int = 100,
+    ) -> float:
+        """Price an American option.
+
+        Args:
+            strike: Strike price
+            expiry: Time to expiry in years
+            vol: Implied volatility
+            option_type: 'call' or 'put'
+            method: 'fd' (finite difference) or 'tree' (binomial)
+            steps: Number of time steps
+
+        Returns:
+            Option price
+        """
+        expiry_days = int(expiry * 365)
+        expiry_date = self._eval_date + ql.Period(expiry_days, ql.Days)
+
+        # Create process
+        process, _ = create_black_scholes_process(
+            spot=self.spot,
+            rate=self.rate,
+            dividend_yield=self.dividend_yield,
+            volatility=vol,
+            eval_date=self._eval_date,
+        )
+
+        # Create American option
+        option = create_american_option(strike, expiry_date, option_type)
+
+        # Create engine
+        factory = PricingEngineFactory(process)
+
+        if method == "fd":
+            engine = factory.finite_difference(time_steps=steps, grid_points=steps)
+        else:
+            engine = factory.binomial_tree(steps=steps)
+
+        option.setPricingEngine(engine)
+
+        return option.NPV()
+
+    def greeks(
+        self,
+        strike: float,
+        expiry: float,
+        vol: float,
+        option_type: str = "call",
+        method: str = "fd",
+        steps: int = 100,
+    ) -> Greeks:
+        """Calculate Greeks for an American option.
+
+        Uses finite differencing to compute sensitivities since
+        analytical Greeks aren't available for American options.
+
+        Args:
+            strike: Strike price
+            expiry: Time to expiry in years
+            vol: Implied volatility
+            option_type: 'call' or 'put'
+            method: 'fd' or 'binomial'
+            steps: Number of steps for numerical method
+
+        Returns:
+            Greeks object with delta, gamma, vega, theta, rho
+        """
+        expiry_days = int(expiry * 365)
+        expiry_date = self._eval_date + ql.Period(expiry_days, ql.Days)
+
+        # Create process
+        process, _ = create_black_scholes_process(
+            spot=self.spot,
+            rate=self.rate,
+            dividend_yield=self.dividend_yield,
+            volatility=vol,
+            eval_date=self._eval_date,
+        )
+
+        # Create American option
+        option = create_american_option(strike, expiry_date, option_type)
+
+        # Create engine
+        factory = PricingEngineFactory(process)
+        if method == "fd":
+            engine = factory.finite_difference(time_steps=steps, grid_points=steps)
+        else:
+            engine = factory.binomial_tree(steps=steps)
+
+        option.setPricingEngine(engine)
+
+        # Compute Greeks via finite differencing
+        h_spot = self.spot * 0.01  # 1% bump for delta/gamma
+        h_vol = 0.01  # 1% bump for vega
+        h_time = 1 / 365  # 1 day for theta
+        h_rate = 0.0001  # 1bp for rho
+
+        base_price = option.NPV()
+
+        # Delta and Gamma via spot bump
+        pricer_up = AmericanOptionPricer(self.spot + h_spot, self.rate, self.dividend_yield)
+        pricer_down = AmericanOptionPricer(self.spot - h_spot, self.rate, self.dividend_yield)
+        price_up = pricer_up.price(strike, expiry, vol, option_type, method, steps)
+        price_down = pricer_down.price(strike, expiry, vol, option_type, method, steps)
+        delta = (price_up - price_down) / (2 * h_spot)
+        gamma = (price_up - 2 * base_price + price_down) / (h_spot ** 2)
+
+        # Vega via vol bump
+        price_vol_up = self.price(strike, expiry, vol + h_vol, option_type, method, steps)
+        vega = (price_vol_up - base_price) / (h_vol * 100)  # Per 1% vol
+
+        # Theta via time decay
+        if expiry > h_time:
+            price_theta = self.price(strike, expiry - h_time, vol, option_type, method, steps)
+            theta = (price_theta - base_price)  # Already per day
+        else:
+            theta = -base_price / expiry * h_time
+
+        # Rho via rate bump
+        pricer_rho = AmericanOptionPricer(self.spot, self.rate + h_rate, self.dividend_yield)
+        price_rho_up = pricer_rho.price(strike, expiry, vol, option_type, method, steps)
+        rho = (price_rho_up - base_price) / (h_rate * 100)  # Per 1%
+
+        return Greeks(
+            delta=delta,
+            gamma=gamma,
+            vega=vega,
+            theta=theta,
+            rho=rho,
+        )
+
+    def early_exercise_premium(
+        self,
+        strike: float,
+        expiry: float,
+        vol: float,
+        option_type: str = "call",
+    ) -> float:
+        """Calculate the early exercise premium.
+
+        Premium = American Price - European Price
+
+        This represents the value of being able to exercise early.
+        For calls on non-dividend paying stocks, this is typically zero.
+
+        Args:
+            strike: Strike price
+            expiry: Time to expiry in years
+            vol: Implied volatility
+            option_type: 'call' or 'put'
+
+        Returns:
+            Early exercise premium
+        """
+        american_price = self.price(strike, expiry, vol, option_type)
+
+        bs = BlackScholes(self.spot, self.rate, self.dividend_yield)
+        european_price = bs.price(strike, expiry, vol, option_type)
+
+        return american_price - european_price
